@@ -237,8 +237,14 @@ def process_file(json_path, patients_csv=None, method='neurokit'):
     # информация о пациенте - сейчас считывается из файла
     if patients_csv:
         df = pd.read_csv(patients_csv, sep=';')
-        fname = json_path.name
-        row = df.loc[df['filename_hr'] == fname]
+        fname = json_path.stem  # "00001_hr"
+        match = df[df['filename_hr'].str.endswith(fname, na=False)]
+        if not match.empty:
+            patient_info = match.iloc[0].to_dict()
+        else:
+            patient_info = {"filename_hr": fname, "note": "Данных пациента нет"}
+    else:
+        patient_info = {"filename_hr": json_path.name, "note": "Информация о пациентах не передана"}
 
     # считаем изоэлектрическую линию + ЧСС + регулярность интервалов для всех отведений по отведению II
     lead_ii = leads_data['II']
@@ -256,7 +262,7 @@ def process_file(json_path, patients_csv=None, method='neurokit'):
     t_offsets = mask_to_idx(signals_ii['ECG_T_Offsets'])
 
     baseline = calculate_baseline(t_offsets, p_onsets, lead_ii)
-    heart_rate = signals_ii['ECG_Rate']
+    heart_rate = signals_ii['ECG_Rate'].tolist()
     rr_intervals_ms, pp_intervals_ms, pq_intervals_ms = calculate_intervals(r_peaks, q_peaks, p_peaks)
     is_rr_regular = identify_rhythm_regularity(rr_intervals_ms)
     is_pp_regular = identify_rhythm_regularity(pp_intervals_ms)
@@ -270,11 +276,12 @@ def process_file(json_path, patients_csv=None, method='neurokit'):
     result = {
         'filename': str(json_path.name),
         'FS': int(fs),
+        'patient_info': patient_info,
         'baseline': baseline,
         'eos_angle': eos_degree,
         'is_normal_eos': is_normal_eos,
         'eos_interpretation': eos_interpretation,
-        'heart_rate': heart_rate[0],
+        'heart_rate': heart_rate,
         'rr_intervals_ms': rr_intervals_ms,
         'pp_intervals_ms': pp_intervals_ms,
         'pq_intervals_ms': pq_intervals_ms,
@@ -282,11 +289,6 @@ def process_file(json_path, patients_csv=None, method='neurokit'):
         'is_pp_regular': is_pp_regular,
         'is_pq_regular': is_pq_regular
     }
-
-    if not row.empty:
-        result['patient_info'] = row.iloc[0].to_dict()
-    else:
-        result['patient_info'] = {"filename_hr": fname, "note": "Данных пациента нет"}
 
     for lead_name in lead_names:
         lead = leads_data[lead_name]
@@ -461,7 +463,37 @@ def main():
             # Визуализация
             fs = result.get("FS", 500)
             plot_path = plots_folder / f"{file.stem}_leadII.png"
-            visualize_lead_with_marks(result, lead_name="II", fs=fs, max_seconds=6, save_path=plot_path)
+            visualize_lead_with_marks(result, lead_name="II", fs=fs, max_seconds=6, save_path=plot_path) 
+
+            # Текстовое заключение
+            hr_values = np.array(result.get("heart_rate", []))
+            is_rr_regular = result.get("is_rr_regular", False)
+            is_normal_eos = result.get("is_normal_eos", False)
+            eos_text = result.get("eos_interpretation", "").capitalize()
+
+            # Частота сердечных сокращений
+            if is_rr_regular:
+                hr_mean = int(round(np.nanmean(hr_values)))
+                hr_text = f"ЧСС {hr_mean}/мин"
+            else:
+                hr_min = int(round(np.nanmin(hr_values)))
+                hr_max = int(round(np.nanmax(hr_values)))
+                hr_text = f"ЧСС {hr_min}-{hr_max}/мин"
+
+            # Ритм
+            rhythm_text = "Ритм регулярный" if is_rr_regular else "Ритм нерегулярный"
+
+            # ЭОС
+            eos_status = "ЭОС не отклонена" if is_normal_eos else "ЭОС отклонена"
+            eos_summary = f"{eos_status}. {eos_text}"
+
+            conclusion = f"{rhythm_text}, {hr_text}. {eos_summary}."
+
+            # Сохраняем заключение в txt
+            txt_path = output_folder / f"{file.stem}_summary.txt"
+            with open(txt_path, "w", encoding="utf-8") as f:
+                f.write(conclusion)
+            print(f"{conclusion}")
 
         except Exception as e:
             print(f"Ошибка при обработке {file.name}: {e}")
