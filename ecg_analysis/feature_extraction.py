@@ -3,9 +3,11 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import neurokit2 as nk
-from math import atan2, degrees
-from scipy.signal import find_peaks
+from math import atan2, degrees, floor
+from scipy.signal import find_peaks 
+from scipy import signal
 import matplotlib.pyplot as plt
+from matplotlib.ticker import MultipleLocator
 
 
 def load_ecg_from_json(json_path):
@@ -14,9 +16,10 @@ def load_ecg_from_json(json_path):
     fs = int(data.get("DiscretizationFrequency", 500))
     leads = {}
     for lead in data['Leads']:
-        name = lead['Name'].strip().upper()
+        name = lead['Name']
+        x = np.array([s['X'] for s in lead['Samples']], dtype=float)
         y = np.array([s['Y'] for s in lead['Samples']], dtype=float)
-        leads[name] = y
+        leads[name] = {'X': x, 'Y': y}
     return leads, fs 
 
 
@@ -110,20 +113,20 @@ def estimate_onset_offset(signal, peak_idx, baseline, side='left', fs=500, thres
 
 
 
-def calculate_eos(lead_I, lead_aVF, q_peaks, r_peaks, s_peaks):
+def calculate_eos(lead_I, lead_aVF, q_peaks_I, r_peaks_I, s_peaks_I, q_peaks_aVF, r_peaks_aVF, s_peaks_aVF):
     """ Расчёт электрической оси сердца (ЭОС) """
 
     def peak_amplitude(signal, peaks):
         return np.mean([signal[p] for p in peaks]) if len(peaks) else 0
 
     # амплитуды зубцов
-    A_Q_I = peak_amplitude(lead_I, q_peaks)
-    A_R_I = peak_amplitude(lead_I, r_peaks)
-    A_S_I = peak_amplitude(lead_I, s_peaks)
+    A_Q_I = peak_amplitude(lead_I, q_peaks_I)
+    A_R_I = peak_amplitude(lead_I, r_peaks_I)
+    A_S_I = peak_amplitude(lead_I, s_peaks_I)
 
-    A_Q_aVF = peak_amplitude(lead_aVF, q_peaks)
-    A_R_aVF = peak_amplitude(lead_aVF, r_peaks)
-    A_S_aVF = peak_amplitude(lead_aVF, s_peaks)
+    A_Q_aVF = peak_amplitude(lead_aVF, q_peaks_aVF)
+    A_R_aVF = peak_amplitude(lead_aVF, r_peaks_aVF)
+    A_S_aVF = peak_amplitude(lead_aVF, s_peaks_aVF)
 
     # алгебраическая сумма амплитуд
     A_I = A_R_I + A_Q_I + A_S_I
@@ -154,9 +157,36 @@ def calculate_eos(lead_I, lead_aVF, q_peaks, r_peaks, s_peaks):
     return alpha, is_normal_eos, interpretation
 
 
-def identify_rhythm():
+def identify_rhythm(p_peaks_dict, qrs_count, is_rr_regular):
     ''' Синусоидный или эктопический ритм '''
-    return 
+    p_peaks_I = p_peaks_dict['I']
+    p_peaks_II = p_peaks_dict['II']
+    p_peaks_aVF = p_peaks_dict['aVF']
+    p_peaks_V2 = p_peaks_dict['V2']
+    p_peaks_V3 = p_peaks_dict['V3']
+    p_peaks_V4 = p_peaks_dict['V4']
+    p_peaks_V5 = p_peaks_dict['V5']
+    p_peaks_V6 = p_peaks_dict['V6']
+    p_peaks_aVR = p_peaks_dict['aVR']
+    p_peaks_aVR = p_peaks_dict['aVF']
+
+    is_sin = False 
+
+    # критерий синусового ритма: зубцы в отведениях I-II, V2-V6 и aVF положительны, в aVR отрицательны
+    # в остальных могут быть разными 
+    is_positive_required_peaks = all(map(lambda i: i > 0,
+                                        p_peaks_I, p_peaks_II, p_peaks_aVF, p_peaks_V2,
+                                        p_peaks_V3, p_peaks_V4, p_peaks_V5, p_peaks_V6))
+    is_negative_required_peaks = all(map(lambda i: i > 0, p_peaks_aVR)) 
+
+    # зубцы P перед каждым QRS
+    is_p_count_normal = len(p_peaks_II) == qrs_count
+
+    # интервал RR или PP постоянный (10%)
+    if is_p_count_normal and is_rr_regular and is_positive_required_peaks and is_negative_required_peaks:
+        is_sin = True
+
+    return is_sin
 
 
 def calculate_baseline(t_offsets, p_onsets, lead_ii, fs=500):
@@ -247,8 +277,9 @@ def process_file(json_path, patients_csv=None, method='neurokit'):
         patient_info = {"filename_hr": json_path.name, "note": "Информация о пациентах не передана"}
 
     # считаем изоэлектрическую линию + ЧСС + регулярность интервалов для всех отведений по отведению II
-    lead_ii = leads_data['II']
+    lead_ii = leads_data['II']['Y']
     signals_ii, _ = nk.ecg_process(lead_ii, sampling_rate=fs, method=method)
+    clean_lead_ii = signals_ii['ECG_Clean'].tolist()
 
     def mask_to_idx(series):
         arr = np.array(series)
@@ -261,26 +292,18 @@ def process_file(json_path, patients_csv=None, method='neurokit'):
     p_onsets = mask_to_idx(signals_ii['ECG_P_Onsets'])
     t_offsets = mask_to_idx(signals_ii['ECG_T_Offsets'])
 
-    baseline = calculate_baseline(t_offsets, p_onsets, lead_ii)
+    baseline = calculate_baseline(t_offsets, p_onsets, clean_lead_ii)
     heart_rate = signals_ii['ECG_Rate'].tolist()
     rr_intervals_ms, pp_intervals_ms, pq_intervals_ms = calculate_intervals(r_peaks, q_peaks, p_peaks)
     is_rr_regular = identify_rhythm_regularity(rr_intervals_ms)
     is_pp_regular = identify_rhythm_regularity(pp_intervals_ms)
     is_pq_regular = identify_rhythm_regularity(pq_intervals_ms)
 
-    # считаем ЭОС
-    lead_I = leads_data['I']
-    lead_aVF = leads_data['AVF']
-    eos_degree, is_normal_eos, eos_interpretation = calculate_eos(lead_I, lead_aVF, q_peaks, r_peaks, s_peaks)
-
     result = {
         'filename': str(json_path.name),
         'FS': int(fs),
         'patient_info': patient_info,
         'baseline': baseline,
-        'eos_angle': eos_degree,
-        'is_normal_eos': is_normal_eos,
-        'eos_interpretation': eos_interpretation,
         'heart_rate': heart_rate,
         'rr_intervals_ms': rr_intervals_ms,
         'pp_intervals_ms': pp_intervals_ms,
@@ -291,7 +314,7 @@ def process_file(json_path, patients_csv=None, method='neurokit'):
     }
 
     for lead_name in lead_names:
-        lead = leads_data[lead_name]
+        lead = leads_data[lead_name]['Y']
 
         # ecg_process: возвращает (signals_df, rpeaks) или (signals_df, info)
         signals, _ = nk.ecg_process(lead, sampling_rate=fs, method=method)
@@ -319,11 +342,8 @@ def process_file(json_path, patients_csv=None, method='neurokit'):
             qrs_onsets.append(int(on))
             qrs_offsets.append(int(off))
 
-        # J-point estimation (per-beat): прямо после qrs_offset
-        j_points = []
-        for off in qrs_offsets:
-            j = estimate_j_point(lead, off, fs=fs, search_ms=60)
-            j_points.append(int(j))
+        # j_point - начало зубца T (конец сегмента ST)
+        j_points = mask_to_idx(signals['ECG_T_Onsets'])
 
         # U-wave estimation per beat: для каждого beat берем T_offset and next P_onset
         u_peaks = []
@@ -356,6 +376,7 @@ def process_file(json_path, patients_csv=None, method='neurokit'):
         lead_dict = {
             'raw_signal': lead.tolist(),
             'clean_signal': signals['ECG_Clean'].tolist(),
+            'timeline_x': leads_data[lead_name]['X'],
             'r_peaks': r_peaks,
             'p_peaks': p_peaks,
             'q_peaks': q_peaks,
@@ -375,30 +396,66 @@ def process_file(json_path, patients_csv=None, method='neurokit'):
             "st_at_j_mv": st_at_j,
             'cycles_count': len(r_peaks)
         }
-        result[lead_name] = lead_dict
+        result[lead_name] = lead_dict 
+
+    # считаем ЭОС
+    clean_lead_I = result['I']['clean_signal']
+    clean_lead_aVF = result['aVF']['clean_signal']
+    q_peaks_I = result['I']['q_peaks']
+    r_peaks_I = result['I']['r_peaks']
+    s_peaks_I = result['I']['s_peaks']
+    q_peaks_aVF = result['aVF']['q_peaks']
+    r_peaks_aVF = result['aVF']['r_peaks']
+    s_peaks_aVF = result['aVF']['s_peaks']
+    eos_degree, is_normal_eos, eos_interpretation = calculate_eos(clean_lead_I, clean_lead_aVF, 
+                                                                    q_peaks_I, r_peaks_I, s_peaks_I,
+                                                                    q_peaks_aVF, r_peaks_aVF, s_peaks_aVF)
+    result['eos_angle'] = eos_degree
+    result['is_normal_eos'] = is_normal_eos
+    result['eos_interpretation'] = eos_interpretation
+
     return to_serializable(result)
 
 
-def visualize_lead_with_marks(result, lead_name='II', fs=500, max_seconds=6, save_path=None):
+def visualize_lead_with_marks(lead_result, baseline, fs=500, max_seconds=6, save_path=None):
     """
     Визуализирует сигнал конкретного отведения с отметками пиков и интервалов.
     """
-    lead = np.array(result[lead_name]['clean_signal'])
-    n = len(lead)
-    time = np.arange(n) / fs
+    x = np.array(lead_result['timeline_x'])
+    y = np.array(lead_result['clean_signal'])
 
     if max_seconds:
         max_samples = int(max_seconds * fs)
-        time = time[:max_samples]
-        lead = lead[:max_samples]
+        x = x[:max_samples]
+        y = y[:max_samples]
+    
 
-    plt.figure(figsize=(16, 5))
-    plt.plot(time, lead, color='black', linewidth=1.2, label=f"Отведение {lead_name}")
+    # 1мм по оси X = 0.02 при fs=500, 0.04 при fs=250, 0.01 при fs=1000 (шаг по X)
+    x_tick = 0.02 * 500 / fs
+    # 1мм по оси Y = 0,1 мВ
+    y_tick = 0.1
 
-    baseline = result.get("baseline", None)
-    if baseline is not None:
-        plt.axhline(y=baseline, linestyle='--', linewidth=1,
-                    label='Baseline (TP)')
+    fig, ax = plt.subplots(figsize=(14, 5))
+    ax.plot(x, y, color='black', linewidth=1.0, label=f"Отведение II")
+
+    # сохраняем соотношение осей (делает секции квадратными)
+    ax.set_aspect(x_tick / y_tick, adjustable='box') 
+
+    # диапазон значений на графике
+    ax.set_xlim(-1, max_seconds + 1) 
+    ax.set_ylim(-2, 2)
+
+    # параметры сетки 1х1 мм
+    ax.xaxis.set_minor_locator(MultipleLocator(x_tick))
+    ax.yaxis.set_minor_locator(MultipleLocator(y_tick))
+    ax.grid(which='minor', color='lightcoral', linewidth=0.4, alpha=0.6)
+
+    # сетка 5х5 мм
+    ax.xaxis.set_major_locator(MultipleLocator(x_tick * 5))
+    ax.yaxis.set_major_locator(MultipleLocator(y_tick * 5))
+    ax.grid(which='major', color='lightcoral', linewidth=0.8, alpha=0.9)
+
+    ax.axhline(y=baseline, linestyle='--', linewidth=1, label='Baseline (TP)')
 
     colors = {
         'p_peaks': 'purple',
@@ -408,35 +465,31 @@ def visualize_lead_with_marks(result, lead_name='II', fs=500, max_seconds=6, sav
         't_peaks': 'orange',
         'u_peaks': 'magenta',
         'j_points': 'black',
-
     }
     for key, color in colors.items():
-        if key in result[lead_name]:
-            peaks = [p for p in result[lead_name][key] if p is not None and p < len(lead)]
+        if key in lead_result:
+            peaks = [p for p in lead_result[key] if p is not None and p < len(y)]
             if peaks:
-                plt.scatter(np.array(peaks)/fs, lead[np.array(peaks)], s=40, color=color, label=key)
+                ax.scatter(np.array(peaks)/fs, y[np.array(peaks)], s=10, color=color, label=key)
 
     intervals = {
-        "QRS": (result[lead_name].get("qrs_onsets"), result[lead_name].get("qrs_offsets"), "cyan", "QRS"),
-        "ST": (result[lead_name].get("qrs_offsets"), result[lead_name].get("j_points"), "pink", "ST"),
+        "QRS": (lead_result.get("qrs_onsets"), lead_result.get("qrs_offsets"), "cyan", "QRS"),
+        "ST": (lead_result.get("qrs_offsets"), lead_result.get("j_points"), "pink", "ST"),
     }
     for key, (starts, ends, color, label) in intervals.items():
         if starts and ends:
             for s, e in zip(starts, ends):
-                if s and e and e < len(lead) and s < e:
-                    plt.axvspan(s/fs, e/fs, color=color, alpha=0.3, label=label)
+                if s and e and e < len(y) and s < e:
+                    ax.axvspan(s/fs, e/fs, color=color, alpha=0.3, label=label)
 
-    plt.title(f"ЭКГ {lead_name} — пиковые точки и интервалы")
-    plt.xlabel("Время (сек)")
-    plt.ylabel("Амплитуда (мВ)")
-    plt.legend(loc='upper right', fontsize=8, ncol=4)
-    plt.grid(alpha=0.3)
-    plt.tight_layout() 
+    ax.set_title(f"ЭКГ по отведению II — пиковые точки и интервалы", fontsize=6)
+    ax.set_xlabel('Время (с)', fontsize=6)
+    ax.set_ylabel('Амплитуда (мВ)', fontsize=6)
+    ax.legend(loc='upper left', fontsize=6, bbox_to_anchor=(1, 1))
+    ax.tick_params(axis='both', labelsize=4)
 
     plt.savefig(save_path, dpi=200)
-    plt.close() 
-
-    #plt.show()
+    plt.close()
 
 
 def main():
@@ -463,7 +516,7 @@ def main():
             # Визуализация
             fs = result.get("FS", 500)
             plot_path = plots_folder / f"{file.stem}_leadII.png"
-            visualize_lead_with_marks(result, lead_name="II", fs=fs, max_seconds=6, save_path=plot_path) 
+            visualize_lead_with_marks(result['II'], result['baseline'], fs=fs, max_seconds=6, save_path=plot_path) 
 
             # Текстовое заключение
             hr_values = np.array(result.get("heart_rate", []))
