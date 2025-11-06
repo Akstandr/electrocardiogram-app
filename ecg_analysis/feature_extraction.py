@@ -39,18 +39,30 @@ def to_serializable(obj):
     return obj 
 
 
-def estimate_u_wave(signal, t_offset_idx, next_p_onset_idx, fs=500, min_prominence=0.02):
-    start = t_offset_idx + 1
-    end = next_p_onset_idx - 1 if next_p_onset_idx is not None else min(len(signal)-1, t_offset_idx + int(400/1000*fs))
-    if start >= end:
-        return None  # нет пространства
+def estimate_u_wave(signal, baseline, t_offset_idx, next_p_onset_idx, fs=500):
+    ''' Находит зубец U (при наличии) '''
+
+    # амплитуда зубца u - 0.1-0.33мВ
+    min_height = 0.1 + baseline 
+    max_height = 0.33 + baseline
+
+    # продолжительность зубца u - 0.08-0.24c
+    min_width = 500 / fs * 4 
+    max_width = 500 / fs * 12
+
+    start = t_offset_idx # зубец u может быть наложен на зубец t
+
+    if next_p_onset_idx is not None:
+        end = next_p_onset_idx - 1 
+    else:
+        end = len(signal)-1 # в конце отведения нет зубца p
     seg = signal[start:end+1]
+
     # ищем небольшой пик в том же направлении, что и T (если T положител., ищем положит.)
-    # настроим prominence относительно амплитуды T
-    peaks, props = find_peaks(seg, prominence=min_prominence)
+    peaks, props = find_peaks(seg, height=[min_height, max_height], width=[min_width, max_width])
     if peaks.size == 0:
         # пробуем обратную полярность
-        peaks, props = find_peaks(-seg, prominence=min_prominence)
+        peaks, props = find_peaks(-seg, height=[-min_height, -max_height], width=[min_width, max_width])
         if peaks.size == 0:
             return None
         else:
@@ -58,59 +70,41 @@ def estimate_u_wave(signal, t_offset_idx, next_p_onset_idx, fs=500, min_prominen
     return start + int(peaks[0])
 
 
-def estimate_j_point(signal, qrs_offset_idx, fs=500, search_ms=60):
-    """
-    Ищем в окне [qrs_offset, qrs_offset + search_ms] первую точку, где производная близка к нулю
-    или где уровень стабилизируется относительно baseline.
-    """
-    n = len(signal)
-    end = min(n-1, qrs_offset_idx + int(search_ms/1000*fs))
-    if qrs_offset_idx >= end:
-        return qrs_offset_idx
-    seg = signal[qrs_offset_idx:end+1]
-    # вычислим первую точку, где наклон небольшой (меньше некоторого порога)
-    deriv = np.diff(seg)
-    if len(deriv)==0:
-        return qrs_offset_idx
-    # порог как 10% от макс(|deriv|)
-    dth = 0.1 * max(1e-9, np.max(np.abs(deriv)))
-    for i, d in enumerate(deriv):
-        if abs(d) < dth:
-            return qrs_offset_idx + i
-    # fallback - конец окна
-    return end 
-
-
-def estimate_onset_offset(signal, peak_idx, baseline, side='left', fs=500, threshold_frac=0.05, max_ms=120):
+def estimate_onset_offset(signal, peak_idx, baseline, border_idx=None, side='left', fs=500, threshold_frac=0.05, max_s=0.08):
     """
     Оценка начала (onset) или конца (offset) зубца относительно базовой линии.
 
     signal: np.array или list - ЭКГ сигнал
-    peak_idx: int - индекс пика зубца
+    peak_idx: int - индекс пика зубца 
+    border_idx - индекс начала пика следующего за текущим при наличии
+    (для комплекса qrs - колнец p при проходе влево, начало t - при проходе вправо)
     baseline: float - значение базовой линии (TP segment)
     side: 'left' -> onset, 'right' -> offset
     fs: частота дискретизации
     threshold_frac: доля амплитуды от пика относительно baseline для определения окончания зубца
-    max_ms: максимальный поиск в миллисекундах
+    max_s: максимальный поиск в секундах 
     """
     n = len(signal)
     peak_amp = abs(signal[peak_idx] - baseline)  # амплитуда относительно baseline
-    thresh = threshold_frac * peak_amp
-    max_samples = int(max_ms / 1000 * fs)
+    thresh = threshold_frac * peak_amp # доля амплитуды пика, которую мы считаем достаточным приближением к baseline для окончания поиска
 
+    max_samples = int(max_s / 10 * fs) # количество индексов для обхода по заданному максимуму секунд
+    if border_idx is not None:
+        max_samples = min(abs(peak_idx - border_idx), max_samples) # ограничиваем обход по началу следующего пика
+    
     if side == 'left':
-        for step in range(1, min(max_samples, peak_idx) + 1):
-            cur = peak_idx - step
+        for step in range(1, max_samples + 1): 
+            cur = peak_idx - step 
+            # когда сигнал становится близок к baseline возвращаем индекс
             if abs(signal[cur] - baseline) < thresh:
                 return cur
         return max(0, peak_idx - max_samples)
     else:
-        for step in range(1, min(max_samples, n - peak_idx - 1) + 1):
+        for step in range(1, max_samples + 1):
             cur = peak_idx + step
             if abs(signal[cur] - baseline) < thresh:
                 return cur
         return min(n - 1, peak_idx + max_samples)
-
 
 
 def calculate_eos(lead_I, lead_aVF, q_peaks_I, r_peaks_I, s_peaks_I, q_peaks_aVF, r_peaks_aVF, s_peaks_aVF):
@@ -322,8 +316,11 @@ def process_file(json_path, patients_csv=None, method='neurokit'):
         p_peaks = mask_to_idx(signals['ECG_P_Peaks'])
         s_peaks = mask_to_idx(signals['ECG_S_Peaks'])
         q_peaks = mask_to_idx(signals['ECG_Q_Peaks'])
+        t_onsets = mask_to_idx(signals['ECG_T_Onsets'])
         t_offsets = mask_to_idx(signals['ECG_T_Offsets'])
+        t_peaks = mask_to_idx(signals['ECG_T_Peaks'])
         p_onsets = mask_to_idx(signals['ECG_P_Onsets'])
+        p_offsets = mask_to_idx(signals['ECG_P_Offsets'])
 
         # если onsets/offsets не найдены — оценим по пикам
         # сделаем оценочные on/off для QRS: onset = left of Q or left of R, offset = right of S or right of R
@@ -333,17 +330,25 @@ def process_file(json_path, patients_csv=None, method='neurokit'):
         for rp in r_peaks:
             q_left = [q for q in q_peaks if q <= rp]
             q_idx = q_left[-1] if q_left else rp
-            on = estimate_onset_offset(lead, q_idx, baseline, side='left', fs=fs)
+
+            p_before = [p for p in p_offsets if p < rp]
+            border_left = p_before[-1] if p_before else None
+
+            on = estimate_onset_offset(lead, q_idx, baseline, border_idx=border_left, side='left', fs=fs, threshold_frac=0.05)
 
             s_right = [s for s in s_peaks if s >= rp]
-            s_idx = s_right[0] if s_right else rp
-            off = estimate_onset_offset(lead, s_idx, baseline, side='right', fs=fs)
+            s_idx = s_right[0] if s_right else rp 
+
+            t_after = [t for t in t_onsets if t > rp]
+            border_right = t_after[0] if t_after else None
+
+            off = estimate_onset_offset(lead, s_idx, baseline, border_idx=border_right, side='right', fs=fs, threshold_frac=0.05)
 
             qrs_onsets.append(int(on))
             qrs_offsets.append(int(off))
 
-        # j_point - начало зубца T (конец сегмента ST)
-        j_points = mask_to_idx(signals['ECG_T_Onsets'])
+        # j_point - (начало сегмента ST)
+        j_points = qrs_offsets
 
         # U-wave estimation per beat: для каждого beat берем T_offset and next P_onset
         u_peaks = []
@@ -356,7 +361,7 @@ def process_file(json_path, patients_csv=None, method='neurokit'):
                 if p_on > off:
                     next_p = p_on
                     break
-            u = estimate_u_wave(lead, off, next_p, fs=fs, min_prominence=0.02)
+            u = estimate_u_wave(lead, baseline, off, next_p, fs=fs)
             u_peaks.append(int(u) if u is not None else None)
 
         # амплитуда j относительно бейзлайна
@@ -474,7 +479,7 @@ def visualize_lead_with_marks(lead_result, baseline, fs=500, max_seconds=6, save
 
     intervals = {
         "QRS": (lead_result.get("qrs_onsets"), lead_result.get("qrs_offsets"), "cyan", "QRS"),
-        "ST": (lead_result.get("qrs_offsets"), lead_result.get("j_points"), "pink", "ST"),
+        "ST": (lead_result.get("qrs_offsets"), lead_result.get("t_onsets"), "gray", "ST"),
     }
     for key, (starts, ends, color, label) in intervals.items():
         if starts and ends:
