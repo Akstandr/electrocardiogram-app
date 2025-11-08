@@ -103,6 +103,227 @@ def estimate_onset_offset(signal, peak_idx, baseline, border_idx=None, side='lef
                 return cur
         return min(n - 1, peak_idx + max_samples)
 
+from scipy.signal import find_peaks
+
+# --- stepwise QRS morphology analyzer ---
+def local_extrema_idx(seg):
+    """
+    Возвращает индексы локальных экстремумов (минимумов и максимумов) внутри массива seg.
+    Использует простую проверку соседей и find_peaks для устойчивости.
+    Индексы относительные (в пределах seg, 0..len(seg)-1).
+    """
+    seg = np.asarray(seg)
+    n = len(seg)
+    if n < 3:
+        return []
+
+    # локальные максимумы
+    peaks_pos, _ = find_peaks(seg)
+    # локальные минимумы — на инвертированном сигнале
+    peaks_neg, _ = find_peaks(-seg)
+
+    # объединяем и сортируем
+    extrema = np.concatenate([peaks_pos, peaks_neg])
+    extrema = np.unique(extrema)
+    extrema = sorted([int(i) for i in extrema if 0 < i < n-1])  # убираем границы
+    return extrema
+
+
+def _amp_letter(amp, max_peak_abs, sequence_state, small_abs_thresh=0.15, rel_thresh=0.4, positive=True):
+    """
+    Присваивает букву по амплитуде, с учетом последовательности (Q, R, S).
+      - большая буква (R/Q/S) если abs(amp) >= max( small_abs_thresh, rel_thresh*max_peak_abs)
+      - маленькая (r/q/s) иначе
+    sequence_state: 'pre_R', 'post_R', 'post_S'
+    """
+    if max_peak_abs <= 0:
+        cutoff = small_abs_thresh
+    else:
+        # Для QRS обычно используют 0.15мВ или 1/4 от R-пика (25% или 40% для некоторых стандартов)
+        cutoff = max(small_abs_thresh, rel_thresh * max_peak_abs)
+
+    is_large = abs(amp) >= cutoff
+
+    if positive:
+        # Положительные пики: R, R'
+        if sequence_state == 'pre_R':
+            return 'R' if is_large else 'r'
+        elif sequence_state == 'post_S':
+            # R' может быть только после S-зубца
+            return "R'" if is_large else "r'"
+        elif sequence_state == 'post_R':
+            # Если после R сразу идет положительный пик (в состоянии ожидания S),
+            return ''
+
+    else:
+        # Отрицательные пики: Q, S
+        if sequence_state == 'pre_R':
+            # Первое отрицательное отклонение до R - это Q
+            return 'Q' if is_large else 'q'
+        elif sequence_state == 'post_R':
+            # Отрицательное отклонение после R - это S
+            return 'S' if is_large else 's'
+
+    return ''
+
+
+def local_extrema_idx(seg):
+    """
+    Возвращает индексы локальных экстремумов (минимумов и максимумов) внутри массива seg.
+    Использует простую проверку соседей и find_peaks для устойчивости.
+    """
+    seg = np.asarray(seg)
+    n = len(seg)
+    if n < 3:
+        return []
+
+    # локальные максимумы
+    peaks_pos, _ = find_peaks(seg)
+    # локальные минимумы — на инвертированном сигнале
+    peaks_neg, _ = find_peaks(-seg)
+
+    # объединяем и сортируем
+    extrema = np.concatenate([peaks_pos, peaks_neg])
+    extrema = np.unique(extrema)
+    extrema = sorted([int(i) for i in extrema if 0 < i < n - 1])  # убираем границы
+    return extrema
+
+
+# Вспомогательная функция _amp_letter должна быть определена выше
+
+def analyze_qrs_stepwise(signal, qrs_onsets, qrs_offsets, baseline=0.0, fs=500):
+    """
+    Пошаговый анализ формы QRS.
+    """
+    results = []
+    signal = np.asarray(signal)
+    n_total = len(signal)
+
+    # Состояния последовательности: pre_R (ожидаем Q или R), post_R (ожидаем S), post_S (ожидаем R')
+
+    for on, off in zip(qrs_onsets, qrs_offsets):
+        res = {'onset': on, 'offset': off, 'morph': None, 'components': [], 'notes': None}
+        if on is None or off is None or on >= off or on < 0 or off > n_total:
+            res['notes'] = 'invalid bounds'
+            results.append(res)
+            continue
+
+        seg = signal[on:off + 1]
+        seg_rel = seg - baseline
+        if len(seg_rel) < 3:
+            res['notes'] = 'too short'
+            results.append(res)
+            continue
+
+        # Все экстремумы внутри сегмента (относительные индексы)
+        extrema = local_extrema_idx(seg_rel)
+
+        # Если экстремумов нет — берем глобальный максимум и минимум
+        if not extrema:
+            max_rel_idx = int(np.argmax(seg_rel))
+            min_rel_idx = int(np.argmin(seg_rel))
+            extrema = sorted(list(set([max_rel_idx, min_rel_idx])))
+
+        # Максимальная абсолютная амплитуда в сегменте для нормировки
+        max_peak_abs = max(abs(np.max(seg_rel)), abs(np.min(seg_rel)), 0.0)
+
+        components = []
+        sequence_state = 'pre_R'  # Начальное состояние: ждем Q или R
+
+        # Проходим экстремумы в порядке возрастания индекса
+        for rel_idx in extrema:
+            amp = float(seg_rel[rel_idx])
+            abs_idx = int(on + rel_idx)
+
+            letter = _amp_letter(amp, max_peak_abs, sequence_state, positive=(amp > 0))
+
+            if letter:
+                components.append({'idx': abs_idx, 'rel_idx': int(rel_idx), 'amp_mv': float(amp), 'letter': letter})
+
+                # Обновление состояния последовательности
+                if letter in ('R', 'r'):
+                    sequence_state = 'post_R'
+                elif letter in ("R'", "r'"):
+                    # После R', снова ждем S
+                    sequence_state = 'post_R'
+                elif letter in ('Q', 'q'):
+                    # После Q, все еще ждем R. Q не меняет состояние 'pre_R'.
+                    pass
+                elif letter in ('S', 's'):
+                    # После S, ждем R'
+                    sequence_state = 'post_S'
+
+
+
+        # Собираем строку морфологии: склеиваем буквы
+        morph_list = [c['letter'] for c in components]
+
+        # Убираем подряд идущие одинаковые буквы (например, r r)
+        morph_compacted = []
+        for ch in morph_list:
+            # Учитываем R и R' как разные
+            if not morph_compacted or morph_compacted[-1] != ch:
+                morph_compacted.append(ch)
+
+        morph_str = ''.join(morph_compacted) if morph_compacted else 'isoelectric'
+
+        res['morph'] = morph_str
+        res['components'] = components
+
+        results.append(res)
+    return results
+
+
+def diagnose_conduction_blocks(mean_pq_ms, mean_qrs_ms, qrs_stepwise_data, fs, lead_name_for_qrs='II'):
+    """
+    Измерение и сравнение амплитуд/продолжительностей с эталоном
+    для определения блокад и патологических Q-зубцов.
+
+    mean_pq_ms: средняя продолжительность интервала PQ (мс)
+    mean_qrs_ms: средняя продолжительность комплекса QRS (мс)
+    qrs_stepwise_data: список всех QRS комплексов с компонентами
+    """
+    diagnosis = []
+    pathology_notes = []
+
+    # --- 1. Диагностика АВ-блокады (I ст.) ---
+    # Норма PQ: 120-200 мс
+    if mean_pq_ms > 200:
+        diagnosis.append(f"АВ-блокада I ст. (PQ={round(mean_pq_ms, 1)} мс)")
+
+    # --- 2. Диагностика Блокады ножек пучка Гиса (БНПГ) ---
+    if mean_qrs_ms >= 120:
+        diagnosis.append(f"Полная БНПГ (QRS={round(mean_qrs_ms, 1)} мс)")
+    elif mean_qrs_ms > 100:
+        diagnosis.append(f"Неполная БНПГ (QRS={round(mean_qrs_ms, 1)} мс)")
+
+    # --- 3. Патологический Q-зубец (признак некроза) ---
+    all_qrs_components = [c for r in qrs_stepwise_data if r and r.get('components') for c in r['components']]
+
+    max_q_amp = 0
+    max_r_amp = 0
+
+    if all_qrs_components:
+        q_amps = [-c['amp_mv'] for c in all_qrs_components if c['letter'] in ('Q', 'q')]
+        r_amps = [c['amp_mv'] for c in all_qrs_components if c['letter'] in ('R', 'r', "R'", "r'")]
+
+        max_q_amp = max(q_amps) if q_amps else 0
+        max_r_amp = max(r_amps) if r_amps else 0
+
+    if max_q_amp > 0 and max_r_amp > 0:
+        q_r_ratio = max_q_amp / max_r_amp
+        if q_r_ratio >= 0.25:
+            pathology_notes.append(
+                f"Патологический Q-зубец: глубина Q составляет {round(q_r_ratio * 100)}% от R (порог 25%).")
+
+    if not diagnosis:
+        diagnosis.append("Нарушений АВ- или внутрижелудочкового проведения не выявлено.")
+
+    return {
+        "conduction_diagnosis": ", ".join(diagnosis),
+        "pathology_notes": pathology_notes
+    }
+
 
 def calculate_eos(lead_I, lead_aVF, q_peaks, r_peaks, s_peaks):
     """ Расчёт электрической оси сердца (ЭОС) """
@@ -427,6 +648,33 @@ def process_file(json_path, patients_csv=None, method='neurokit'):
     for on, off in zip(qrs_onsets, qrs_offsets):
         qrs_durations_ms.append((off - on)/fs*1000.0)
 
+    qrs_durations_ms = []
+    for on, off in zip(qrs_onsets, qrs_offsets):
+        qrs_durations_ms.append((off - on) / fs * 1000.0)
+
+    mean_qrs_ms = float(np.mean(qrs_durations_ms)) if qrs_durations_ms else 0
+    qrs_stepwise = analyze_qrs_stepwise(cleaned_signal, qrs_onsets, qrs_offsets, baseline=baseline, fs=fs)
+    from collections import Counter
+    morph_list = [r['morph'] for r in qrs_stepwise if r.get('morph')]
+    morph_counter = Counter(morph_list)
+    if morph_counter:
+        predominant_morph = morph_counter.most_common(1)[0][0]
+    else:
+        predominant_morph = "неопределена"
+
+    intervals = calculate_intervals(r_peaks, q_peaks, p_peaks, t_peaks)
+    intervals_data = intervals.get("PQ") or {}
+    pq_durations_ms = intervals_data.get("durations_ms") or []
+    mean_pq_ms = float(np.mean(pq_durations_ms)) if pq_durations_ms else 0
+
+    diagnosis_results = diagnose_conduction_blocks(
+        mean_pq_ms=mean_pq_ms,
+        mean_qrs_ms=mean_qrs_ms,
+        qrs_stepwise_data=qrs_stepwise,
+        fs=fs,
+        lead_name_for_qrs='II'
+    )
+
     result = {
         'filename': str(json_path.name),
         'FS': int(fs),
@@ -453,7 +701,12 @@ def process_file(json_path, patients_csv=None, method='neurokit'):
         "j_points": j_points,
         "qrs_durations_ms": qrs_durations_ms,
         'cycles_count': len(r_peaks),
-        'leads_results': {}
+        'leads_results': {},
+        'qrs_morphologies_stepwise': [r['morph'] for r in qrs_stepwise],
+        "qrs_morphologies_stats": morph_counter,
+        "predominant_qrs_morphology": predominant_morph,
+        "conduction_diagnosis": diagnosis_results['conduction_diagnosis'],
+        "pathology_notes": diagnosis_results['pathology_notes']
 
     }
 
@@ -739,6 +992,8 @@ def main():
         print(f"Обработка {file.name}")
         try:
             result = process_file(file, patients_csv, method='neurokit')
+
+            print(json.dumps(result, indent=2, ensure_ascii=False))
 
             # Сохраняем результат
             out_path = output_folder / f"{file.stem}_processed.json"
