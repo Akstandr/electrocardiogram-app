@@ -963,12 +963,19 @@ def get_conclusion(result):
 
     st_durations_text = ", ".join(str(d) for d in durations_ST) if durations_ST else "отсутствуют"
 
+    conduction_diagnosis = result.get("conduction_diagnosis", "Нарушений проведения не выявлено.")
+    predominant_morph = result.get("predominant_qrs_morphology", "N/A")
+    mean_qrs_ms = result.get("mean_qrs_ms", 0)
+
     # текст
     conclusion_text = (
         f"{hr_text}. {rhythm_text}. {eos_summary}.\n"
         + f"Сегмент ST в отведении II: продолжительности {st_durations_text} сек., "
-        f"средняя продолжительность {mean_duration_ST:.3f} сек." 
+        f"средняя продолжительность {mean_duration_ST:.3f} сек.\n"
+        + f"Проведение: {conduction_diagnosis} (средняя длительность QRS: {mean_qrs_ms:.1f} мс).\n"
+        + f"Морфология QRS: Преобладающая форма в отведении II - {predominant_morph}."
     )
+
 
     return {
         "text": conclusion_text,
@@ -992,8 +999,6 @@ def main():
         print(f"Обработка {file.name}")
         try:
             result = process_file(file, patients_csv, method='neurokit')
-
-            print(json.dumps(result, indent=2, ensure_ascii=False))
 
             # Сохраняем результат
             out_path = output_folder / f"{file.stem}_processed.json"
