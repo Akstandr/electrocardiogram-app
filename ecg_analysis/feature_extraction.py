@@ -5,10 +5,7 @@ import numpy as np
 import pandas as pd
 import neurokit2 as nk
 from math import atan2, degrees, floor
-from scipy.signal import find_peaks 
-from scipy import signal
-import matplotlib.pyplot as plt
-from matplotlib.ticker import MultipleLocator, MaxNLocator
+from scipy.signal import find_peaks
 
 
 def load_ecg_from_json(json_path):
@@ -200,21 +197,48 @@ def calculate_baseline(t_offsets, p_onsets, lead_ii, fs=500):
             tp_segments.append(seg)
 
     if not tp_segments:
-        # фоллбек — медиана по всему сигналу
+        # медиана по всему сигналу
         return float(np.median(lead_ii))
 
     all_tp = np.concatenate(tp_segments)
     return float(np.median(all_tp))
 
 
-def calculate_intervals(r_peaks, q_peaks, p_peaks, fs=500):
-    ''' Вычисляет интервалы RR, PP, PQ (PR если Q нет) в милисекундах
-    '''
-    
-    rr_intervals_ms = np.diff(np.array(r_peaks)) / fs * 1000.0 if len(r_peaks) >= 2 else np.array([])
-    pp_intervals_ms = np.diff(np.array(p_peaks)) / fs * 1000.0 if len(p_peaks) >= 2 else np.array([])
+def calculate_intervals(r_peaks, q_peaks, p_peaks, t_peaks, fs=500):
+    """
+    Вычисляет интервалы RR, PP, PQ (PR если Q нет), QT, TP в миллисекундах
+    и возвращает словарь словарей с их началами, концами, длительностями
+    """
+    def to_ms(samples):
+        return samples / fs * 1000.0
 
-    pq_intervals_ms = []
+    result = {
+        "RR": {"onsets": [], "offsets": [], "durations_ms": []},
+        "PP": {"onsets": [], "offsets": [], "durations_ms": []},
+        "PQ": {"onsets": [], "offsets": [], "durations_ms": []},
+        "QT": {"onsets": [], "offsets": [], "durations_ms": []},
+        "TP": {"onsets": [], "offsets": [], "durations_ms": []},
+    }
+
+    # RR интервалы
+    if len(r_peaks) >= 2:
+        onsets = r_peaks[:-1]
+        offsets = r_peaks[1:]
+        durations = to_ms(np.diff(r_peaks))
+        result["RR"]["onsets"] = onsets.tolist()
+        result["RR"]["offsets"] = offsets.tolist()
+        result["RR"]["durations_ms"] = durations.tolist()
+
+    # PP 
+    if len(p_peaks) >= 2:
+        onsets = p_peaks[:-1]
+        offsets = p_peaks[1:]
+        durations = to_ms(np.diff(p_peaks))
+        result["PP"]["onsets"] = onsets.tolist()
+        result["PP"]["offsets"] = offsets.tolist()
+        result["PP"]["durations_ms"] = durations.tolist()
+
+    # PQ (PR если Q нет)
     for p in p_peaks:
         qs_after = [q for q in q_peaks if q > p]
         if qs_after:
@@ -223,9 +247,29 @@ def calculate_intervals(r_peaks, q_peaks, p_peaks, fs=500):
             rs_after = [r for r in r_peaks if r > p]
             q_index = rs_after[0] if rs_after else None
         if q_index:
-            pq_intervals_ms.append((q_index - p)/fs*1000.0)
-    pq_intervals_ms = np.array(pq_intervals_ms)
-    return rr_intervals_ms, pp_intervals_ms, pq_intervals_ms
+            result["PQ"]["onsets"].append(p)
+            result["PQ"]["offsets"].append(q_index)
+            result["PQ"]["durations_ms"].append((q_index - p) / fs * 1000.0)
+
+    # QT
+    for q in q_peaks:
+        ts_after = [t for t in t_peaks if t > q]
+        if ts_after:
+            t_index = ts_after[0]
+            result["QT"]["onsets"].append(q)
+            result["QT"]["offsets"].append(t_index)
+            result["QT"]["durations_ms"].append((t_index - q) / fs * 1000.0)
+
+    # TP
+    for t in t_peaks:
+        ps_after = [p for p in p_peaks if p > t]
+        if ps_after:
+            p_index = ps_after[0]
+            result["TP"]["onsets"].append(t)
+            result["TP"]["offsets"].append(p_index)
+            result["TP"]["durations_ms"].append((p_index - t) / fs * 1000.0)
+
+    return result
 
 
 def identify_rhythm_regularity(intervals):
@@ -313,7 +357,8 @@ def process_file(json_path, patients_csv=None, method='neurokit'):
 
     baseline = calculate_baseline(t_offsets, p_onsets, cleaned_signal)
 
-    rr_intervals_ms, pp_intervals_ms, pq_intervals_ms = calculate_intervals(r_peaks, q_peaks, p_peaks)
+    intervals = calculate_intervals(r_peaks, q_peaks, p_peaks, t_peaks)
+    rr_intervals_ms, pp_intervals_ms, pq_intervals_ms = intervals["RR"]["durations_ms"], intervals["PP"]["durations_ms"], intervals["PQ"]["durations_ms"]
     is_rr_regular = identify_rhythm_regularity(rr_intervals_ms)
     is_pp_regular = identify_rhythm_regularity(pp_intervals_ms)
     is_pq_regular = identify_rhythm_regularity(pq_intervals_ms)
@@ -328,8 +373,6 @@ def process_file(json_path, patients_csv=None, method='neurokit'):
         heart_rate = [hr_min, hr_max]
 
     # если onsets/offsets не найдены — оценим по пикам
-    # сделаем оценочные on/off для QRS: onset = left of Q or left of R, offset = right of S or right of R
-    # для этого ищем ближайшие пики q, r, s рядом с каждым R
     qrs_onsets = []
     qrs_offsets = []
 
@@ -367,21 +410,19 @@ def process_file(json_path, patients_csv=None, method='neurokit'):
     # j_point - (начало сегмента ST)
     j_points = qrs_offsets
 
-    # U-wave estimation per beat: для каждого beat берем T_offset and next P_onset
+    # зубец U
     u_peaks = []
-    # prepare next P_onset map
-    p_onset_sorted = sorted(p_onsets)
     for i, off in enumerate(t_offsets):
-        # find next P_onset after t_offset
+        # след p_onset после t_offset
         next_p = None
-        for p_on in p_onset_sorted:
+        for p_on in p_onsets:
             if p_on > off:
                 next_p = p_on
                 break
         u = estimate_u_wave(cleaned_signal, baseline, off, next_p, fs=fs)
         u_peaks.append(int(u) if u is not None else None) 
     
-    # QRS durations (ms)
+    # QRS продолжительности
     qrs_durations_ms = []
     for on, off in zip(qrs_onsets, qrs_offsets):
         qrs_durations_ms.append((off - on)/fs*1000.0)
@@ -392,9 +433,7 @@ def process_file(json_path, patients_csv=None, method='neurokit'):
         'patient_info': patient_info,
         'baseline': baseline,
         'heart_rate': heart_rate,
-        'rr_intervals_ms': rr_intervals_ms,
-        'pp_intervals_ms': pp_intervals_ms,
-        'pq_intervals_ms': pq_intervals_ms,
+        'intervals': intervals,
         'is_rr_regular': is_rr_regular,
         'is_pp_regular': is_pp_regular,
         'is_pq_regular': is_pq_regular,
@@ -455,7 +494,7 @@ def process_file(json_path, patients_csv=None, method='neurokit'):
     return to_serializable(result)
 
 
-def visualize_ecg_plotly_mm(result, fs=500, save_path='ecg.json'):
+def visualize_ecg(result, fs=500, save_path='ecg.json'):
     """
     Интерактивная визуализация ЭКГ с миллиметровой сеткой
     """
@@ -560,7 +599,130 @@ def visualize_ecg_plotly_mm(result, fs=500, save_path='ecg.json'):
 
     with open(save_path, "w", encoding="utf-8") as f:
         f.write(graph_json)
-    fig.show()
+
+    return graph_json
+
+
+def get_conclusion(result):
+    hr = np.array(result.get("heart_rate", []))
+    is_rr_regular = result.get("is_rr_regular", False)
+    is_normal_eos = result.get("is_normal_eos", False)
+    eos_text = result.get("eos_interpretation", "").capitalize()
+    eos_angle = result.get("eos_angle")
+    is_sin = result.get('is_sin')
+
+    rhythm_text = "Ритм синусовый, " if is_sin else "Ритм эктопический (не синусовый), "
+    if is_rr_regular:
+        hr_text = f"ЧСС {hr}/мин"
+        rhythm_text += "регулярный"
+    else:
+        hr_text = f"ЧСС {hr[0]}-{hr[1]}/мин"
+        rhythm_text += "нерегулярный"
+
+    eos_status = "ЭОС не отклонена" if is_normal_eos else "ЭОС отклонена"
+    eos_summary = f"{eos_status}. {eos_text} (угол α = {round(eos_angle, 1)})"
+
+    # зубцы
+    wave_types = {
+        "P": ("p_peaks", "p_onsets", "p_offsets"),
+        "Q": ("q_peaks", "q_onsets", "q_offsets"),
+        "R": ("r_peaks", "r_onsets", "r_offsets"),
+        "S": ("s_peaks", "s_onsets", "s_offsets"),
+        "T": ("t_peaks", "t_onsets", "t_offsets"),
+        "U": ("u_peaks", "u_onsets", "u_offsets"),
+        "QRS-комплекс": ("", "qrs_onsets", "qrs_offsets"),
+    }
+
+    clean_signal = result['leads_results']['II']['clean_signal']
+    baseline = result['baseline']
+
+    # таблица по зубцам
+    waves_table = []
+
+    for name, (peaks_key, onsets_key, offsets_key) in wave_types.items():
+        peaks = result.get(peaks_key) or []
+        onsets = result.get(onsets_key) or []
+        offsets = result.get(offsets_key) or []
+
+        if onsets and offsets:
+            if peaks:
+                amps = [round(clean_signal[idx] - baseline, 3) for idx in peaks]
+                mean_amplitude = round(float(np.mean(amps)), 3)
+            else:
+                amps = '-'
+                mean_amplitude = '-'
+            durations = [round((offsets[i] - onsets[i]) * 0.002, 3) for i in range(len(onsets))]
+            ranges = [f"{round(onsets[i] * 0.002, 3)}–{round(offsets[i] * 0.002, 3)}" for i in range(len(onsets))]
+
+            waves_table.append({
+                "wave": name,
+                "amplitudes": amps,
+                "mean_amplitude": mean_amplitude,
+                "durations": durations,
+                "mean_duration": round(float(np.mean(durations)), 3),
+                "ranges": ranges
+            })
+        else:
+            waves_table.append({
+                "wave": name,
+                "amplitudes": [],
+                "mean_amplitude": 0,
+                "durations": [],
+                "mean_duration": 0,
+                "ranges": []
+            })
+
+    # таблица по интервалам
+    intervals_data = result.get("intervals", {})
+    intervals_table = []
+
+    for name, values in intervals_data.items():
+        durations = values.get("durations_ms") or []
+        onsets = values.get("onsets") or []
+        offsets = values.get("offsets") or []
+
+        ranges = [f"{round(onsets[i] * 0.002, 3)}–{round(offsets[i] * 0.002, 3)}" for i in range(len(onsets))]
+
+        intervals_table.append({
+            "interval": name,
+            "durations_ms": durations,
+            "mean_duration_ms": round(float(np.mean(durations)), 3),
+            "ranges": ranges
+        })
+
+    # ST
+    st_table = []
+    for lead_name, lead_data in result['leads_results'].items():
+        st_at_j = lead_data.get('st_at_j_mv') or []
+        st_values = [round(v, 3) for v in st_at_j if v is not None]
+
+        st_table.append({
+            "lead": lead_name,
+            "ST_elevations_at_J": st_values, 
+            "mean_ST_elevation": round(float(np.mean(st_values)), 3) if st_values else 0
+        })
+
+    # длительность ST
+    st_onsets = result.get("qrs_offsets") or []
+    st_offsets = result.get("t_onsets") or []
+    durations_ST = [round((st_offsets[i] - st_onsets[i]) * 0.002, 3) for i in range(len(st_onsets))] if st_onsets and st_offsets else []
+    mean_duration_ST = float(np.mean(durations_ST)) if durations_ST else 0
+
+    st_durations_text = ", ".join(str(d) for d in durations_ST) if durations_ST else "отсутствуют"
+
+    # текст
+    conclusion_text = (
+        f"{hr_text}. {rhythm_text}. {eos_summary}.\n"
+        + f"Сегмент ST в отведении II: продолжительности {st_durations_text} сек., "
+        f"средняя продолжительность {mean_duration_ST:.3f} сек." 
+    )
+
+    return {
+        "text": conclusion_text,
+        "waves_table": waves_table,
+        "intervals_table": intervals_table,
+        "st_table": st_table
+    }
 
 
 def main():
@@ -587,33 +749,10 @@ def main():
             # Визуализация
             fs = result.get("FS", 500)
             plot_path = plots_folder / f"{file.stem}_plot.json"
-            visualize_ecg_plotly_mm(result, fs, plot_path)
+            plot_json = visualize_ecg(result, fs, plot_path)
 
             # Текстовое заключение
-            hr_values = np.array(result.get("heart_rate", []))
-            is_rr_regular = result.get("is_rr_regular", False)
-            is_normal_eos = result.get("is_normal_eos", False)
-            eos_text = result.get("eos_interpretation", "").capitalize()
-            is_sin = result.get('is_sin')
-
-            # Частота сердечных сокращений
-            if is_rr_regular:
-                hr_mean = int(round(np.nanmean(hr_values)))
-                hr_text = f"ЧСС {hr_mean}/мин"
-            else:
-                hr_min = int(round(np.nanmin(hr_values)))
-                hr_max = int(round(np.nanmax(hr_values)))
-                hr_text = f"ЧСС {hr_min}-{hr_max}/мин"
-
-            # Ритм 
-            rhythm_text = "Ритм синусовый, " if is_sin else "Ритм эктопический (не синусовый), "
-            rhythm_text += "регулярный" if is_rr_regular else "нерегулярный"
-
-            # ЭОС
-            eos_status = "ЭОС не отклонена" if is_normal_eos else "ЭОС отклонена"
-            eos_summary = f"{eos_status}. {eos_text}"
-
-            conclusion = f"{rhythm_text}, {hr_text}. {eos_summary}."
+            conclusion = get_conclusion(result)['text']
 
             # Сохраняем заключение в txt
             txt_path = output_folder / f"{file.stem}_summary.txt"
