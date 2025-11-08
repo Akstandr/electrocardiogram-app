@@ -1,0 +1,6 @@
+numpy
+pandas
+neurokit2 
+matplotlib
+scipy
+plotly
