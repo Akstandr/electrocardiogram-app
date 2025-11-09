@@ -1,0 +1,29 @@
+version: '3.8'
+
+services:
+  ecg-backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ecg-backend
+    ports:
+      - "8000:8000"
+    volumes:
+      # Монтируем модели (если нужно обновлять без пересборки)
+      - ./ecg_predict:/app/ecg_predict:ro
+      # Кэш HuggingFace моделей (чтобы не загружать каждый раз)
+      - huggingface_cache:/root/.cache/huggingface
+    environment:
+      - PYTHONUNBUFFERED=1
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/ecg/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s  # Даем время на загрузку моделей при первом запуске (может занять время)
+
+volumes:
+  huggingface_cache:
+    driver: local
+
